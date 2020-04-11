@@ -4,6 +4,9 @@ import Authentication
 import SendGrid
 
 struct WebsiteController: RouteCollection {
+
+  let imageFolder = "ProfilePictures/"
+
   func boot(router: Router) throws {
     let authSessionRoutes = router.grouped(User.authSessionsMiddleware())
     authSessionRoutes.get(use: indexHandler)
@@ -21,6 +24,7 @@ struct WebsiteController: RouteCollection {
     authSessionRoutes.post("forgottenPassword", use: forgottenPasswordPostHandler)
     authSessionRoutes.get("resetPassword", use: resetPasswordHandler)
     authSessionRoutes.post(ResetPasswordData.self, at: "resetPassword", use: resetPasswordPostHandler)
+    authSessionRoutes.get("users", User.parameter, "profilePicture", use: getUsersProfilePictureHandler)
 
     let protectedRoutes = authSessionRoutes.grouped(RedirectMiddleware<User>(path: "/login"))
     protectedRoutes.get("acronyms", "create", use: createAcronymHandler)
@@ -28,6 +32,8 @@ struct WebsiteController: RouteCollection {
     protectedRoutes.get("acronyms", Acronym.parameter, "edit", use: editAcronymHandler)
     protectedRoutes.post("acronyms", Acronym.parameter, "edit", use: editAcronymPostHandler)
     protectedRoutes.post("acronyms", Acronym.parameter, "delete", use: deleteAcronymHandler)
+    protectedRoutes.get("users", User.parameter, "addProfilePicture", use: addProfilePictureHandler)
+    protectedRoutes.post("users", User.parameter, "addProfilePicture", use: addProfilePicturePostHandler)
   }
 
   func indexHandler(_ req: Request) throws -> Future<View> {
@@ -53,7 +59,8 @@ struct WebsiteController: RouteCollection {
   func userHandler(_ req: Request) throws -> Future<View> {
     return try req.parameters.next(User.self).flatMap(to: View.self) { user in
       return try user.acronyms.query(on: req).all().flatMap(to: View.self) { acronyms in
-        let context = UserContext(title: user.name, user: user, acronyms: acronyms)
+        let loggedInUser = try req.authenticated(User.self)
+        let context = UserContext(title: user.name, user: user, acronyms: acronyms, authenticatedUser: loggedInUser)
         return try req.view().render("user", context)
       }
     }
@@ -238,7 +245,7 @@ struct WebsiteController: RouteCollection {
         <p>You've requested to reset your password. <a href=\"http://localhost:8080/resetPassword?token=\(resetTokenString)\">Click here</a> to reset your password.</p>
         """
         let emailAddress = EmailAddress(email: user.email, name: user.name)
-        let fromEmail = EmailAddress(email: "gulivero1773@gmail.com", name: "Vapor TIL")
+        let fromEmail = EmailAddress(email: "0xtimc@gmail.com", name: "Vapor TIL")
         let emailConfig = Personalization(to: [emailAddress], subject: "Reset Your Password")
         let email = SendGridEmail(personalizations: [emailConfig], from: fromEmail, content: [["type": "text/html",
                                                                                                "value": emailContent]])
@@ -279,6 +286,34 @@ struct WebsiteController: RouteCollection {
     resetPasswordUser.password = newPassword
     return resetPasswordUser.save(on: req).transform(to: req.redirect(to: "/login"))
   }
+
+  func addProfilePictureHandler(_ req: Request) throws -> Future<View> {
+    return try req.parameters.next(User.self).flatMap { user in
+      try req.view().render("addProfilePicture", ["title": "Add Profile Picture", "username": user.name])
+    }
+  }
+
+  func addProfilePicturePostHandler(_ req: Request) throws -> Future<Response> {
+    return try flatMap(to: Response.self, req.parameters.next(User.self), req.content.decode(ImageUploadData.self)) { user, imageData in
+      let workPath = try req.make(DirectoryConfig.self).workDir
+      let name = try "\(user.requireID())-\(UUID().uuidString).jpg"
+      let path = workPath + self.imageFolder + name
+      FileManager().createFile(atPath: path, contents: imageData.picture, attributes: nil)
+      user.profilePicture = name
+      let redirect = try req.redirect(to: "/users/\(user.requireID())")
+      return user.save(on: req).transform(to: redirect)
+    }
+  }
+
+  func getUsersProfilePictureHandler(_ req: Request) throws -> Future<Response> {
+    return try req.parameters.next(User.self).flatMap(to: Response.self) { user in
+      guard let filename = user.profilePicture else {
+        throw Abort(.notFound)
+      }
+      let path = try req.make(DirectoryConfig.self).workDir + self.imageFolder + filename
+      return try req.streamFile(at: path)
+    }
+  }
 }
 
 struct IndexContext: Encodable {
@@ -299,6 +334,7 @@ struct UserContext: Encodable {
   let title: String
   let user: User
   let acronyms: [Acronym]
+  let authenticatedUser: User?
 }
 
 struct AllUsersContext: Encodable {
@@ -395,4 +431,8 @@ struct ResetPasswordContext: Encodable {
 struct ResetPasswordData: Content {
   let password: String
   let confirmPassword: String
+}
+
+struct ImageUploadData: Content {
+  var picture: Data
 }
