@@ -1,6 +1,7 @@
 import Vapor
 import Leaf
 import Authentication
+import SendGrid
 
 struct WebsiteController: RouteCollection {
   func boot(router: Router) throws {
@@ -16,6 +17,10 @@ struct WebsiteController: RouteCollection {
     authSessionRoutes.post("logout", use: logoutHandler)
     authSessionRoutes.get("register", use: registerHandler)
     authSessionRoutes.post(RegisterData.self, at: "register", use: registerPostHandler)
+    authSessionRoutes.get("forgottenPassword", use: forgottenPasswordHandler)
+    authSessionRoutes.post("forgottenPassword", use: forgottenPasswordPostHandler)
+    authSessionRoutes.get("resetPassword", use: resetPasswordHandler)
+    authSessionRoutes.post(ResetPasswordData.self, at: "resetPassword", use: resetPasswordPostHandler)
 
     let protectedRoutes = authSessionRoutes.grouped(RedirectMiddleware<User>(path: "/login"))
     protectedRoutes.get("acronyms", "create", use: createAcronymHandler)
@@ -182,46 +187,98 @@ struct WebsiteController: RouteCollection {
     try req.unauthenticateSession(User.self)
     return req.redirect(to: "/")
   }
-    
-    func registerHandler(_ req: Request) throws -> Future<View> {
-      let context: RegisterContext
-      if let message = req.query[String.self, at: "message"] {
-        context = RegisterContext(message: message)
+
+  func registerHandler(_ req: Request) throws -> Future<View> {
+    let context: RegisterContext
+    if let message = req.query[String.self, at: "message"] {
+      context = RegisterContext(message: message)
+    } else {
+      context = RegisterContext()
+    }
+    return try req.view().render("register", context)
+  }
+
+  func registerPostHandler(_ req: Request, data: RegisterData) throws -> Future<Response> {
+    do {
+      try data.validate()
+    } catch (let error) {
+      let redirect: String
+      if let error = error as? ValidationError,
+        let message = error.reason.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+        redirect = "/register?message=\(message)"
       } else {
-        context = RegisterContext()
+        redirect = "/register?message=Unknown+error"
       }
-      return try req.view().render("register", context)
+      return req.future(req.redirect(to: redirect))
     }
-    
-    func registerPostHandler(_ req: Request, data: RegisterData) throws -> Future<Response> {
-      // 2
-        do {
-          try data.validate()
-        } catch (let error) {
-          let redirect: String
-          if let error = error as? ValidationError,
-            let message = error.reason.addingPercentEncoding(
-              withAllowedCharacters: .urlQueryAllowed) {
-            redirect = "/register?message=\(message)"
-          } else {
-            redirect = "/register?message=Unknown+error"
-          }
-          return req.future(req.redirect(to: redirect))
+
+    let password = try BCrypt.hash(data.password)
+    let user = User(name: data.name, username: data.username, password: password, email: data.emailAddress)
+    return user.save(on: req).map(to: Response.self) { user in
+      try req.authenticateSession(user)
+      return req.redirect(to: "/")
+    }
+  }
+
+  func forgottenPasswordHandler(_ req: Request) throws -> Future<View> {
+    return try req.view().render("forgottenPassword", ["title": "Reset Your Password"])
+  }
+
+  func forgottenPasswordPostHandler(_ req: Request) throws -> Future<View> {
+    let email = try req.content.syncGet(String.self, at: "email")
+    return User.query(on: req).filter(\.email == email).first().flatMap(to: View.self) { user in
+      guard let user = user else {
+        return try req.view().render("forgottenPasswordConfirmed", ["title": "Password Reset Email Sent"])
+      }
+
+      let resetTokenString = try CryptoRandom().generateData(count: 32).base32EncodedString()
+      let resetToken = try ResetPasswordToken(token: resetTokenString, userID: user.requireID())
+      return resetToken.save(on: req).flatMap(to: View.self) { _ in
+        let emailContent = """
+        <p>You've requested to reset your password. <a href=\"http://localhost:8080/resetPassword?token=\(resetTokenString)\">Click here</a> to reset your password.</p>
+        """
+        let emailAddress = EmailAddress(email: user.email, name: user.name)
+        let fromEmail = EmailAddress(email: "gulivero1773@gmail.com", name: "Vapor TIL")
+        let emailConfig = Personalization(to: [emailAddress], subject: "Reset Your Password")
+        let email = SendGridEmail(personalizations: [emailConfig], from: fromEmail, content: [["type": "text/html",
+                                                                                               "value": emailContent]])
+        let sendGridClient = try req.make(SendGridClient.self)
+        return try sendGridClient.send([email], on: req.eventLoop).flatMap(to: View.self) { _ in
+          return try req.view().render("forgottenPasswordConfirmed", ["title": "Password Reset Email Sent"])
         }
-      let password = try BCrypt.hash(data.password)
-      // 3
-      let user = User(
-        name: data.name,
-        username: data.username,
-        password: password)
-      // 4
-      return user.save(on: req).map(to: Response.self) { user in
-        // 5
-        try req.authenticateSession(user)
-        // 6
-        return req.redirect(to: "/")
       }
     }
+  }
+
+  func resetPasswordHandler(_ req: Request) throws -> Future<View> {
+    guard let token = req.query[String.self, at: "token"] else {
+      return try req.view().render("resetPassword", ResetPasswordContext(error: true))
+    }
+    return ResetPasswordToken.query(on: req).filter(\.token == token).first().map(to: ResetPasswordToken.self) { token in
+      guard let token = token else {
+        throw Abort.redirect(to: "/")
+      }
+      return token
+    }.flatMap { token in
+      return token.user.get(on: req).flatMap { user in
+        try req.session().set("ResetPasswordUser", to: user)
+        return token.delete(on: req)
+      }
+    }.flatMap {
+      try req.view().render("resetPassword", ResetPasswordContext())
+    }
+  }
+
+  func resetPasswordPostHandler(_ req: Request, data: ResetPasswordData) throws -> Future<Response> {
+    guard data.password == data.confirmPassword else {
+      return try req.view().render("resetPassword", ResetPasswordContext(error: true)).encode(for: req)
+    }
+    let resetPasswordUser = try req.session().get("ResetPasswordUser", as: User.self)
+    try req.session()["ResetPasswordUser"] = nil
+    let newPassword = try BCrypt.hash(data.password)
+    resetPasswordUser.password = newPassword
+    return resetPasswordUser.save(on: req).transform(to: req.redirect(to: "/login"))
+  }
 }
 
 struct IndexContext: Encodable {
@@ -295,11 +352,11 @@ struct LoginPostData: Content {
 
 struct RegisterContext: Encodable {
   let title = "Register"
-    let message: String?
+  let message: String?
 
-    init(message: String? = nil) {
-      self.message = message
-    }
+  init(message: String? = nil) {
+    self.message = message
+  }
 }
 
 struct RegisterData: Content {
@@ -307,28 +364,35 @@ struct RegisterData: Content {
   let username: String
   let password: String
   let confirmPassword: String
+  let emailAddress: String
 }
 
 extension RegisterData: Validatable, Reflectable {
-  // 2
   static func validations() throws -> Validations<RegisterData> {
-    // 3
     var validations = Validations(RegisterData.self)
-    // 4
     try validations.add(\.name, .ascii)
-    // 5
-    try validations.add(\.username,
-                        .alphanumeric && .count(3...))
-    // 6
+    try validations.add(\.username, .alphanumeric && .count(3...))
     try validations.add(\.password, .count(8...))
-    
- validations.add("passwords match") { model in
-      // 2
+    try validations.add(\.emailAddress, .email)
+    validations.add("passwords match") { model in
       guard model.password == model.confirmPassword else {
-        // 3
         throw BasicValidationError("passwords don’t match")
       }
     }
     return validations
   }
+}
+
+struct ResetPasswordContext: Encodable {
+  let title = "Reset Password"
+  let error: Bool?
+
+  init(error: Bool? = false) {
+    self.error = error
+  }
+}
+
+struct ResetPasswordData: Content {
+  let password: String
+  let confirmPassword: String
 }
