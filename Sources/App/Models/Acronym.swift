@@ -1,9 +1,3 @@
-//
-//  Acronym.swift
-//  App
-//
-//  Created by Mykola Buhaiov on 07.04.2020.
-
 import Vapor
 import FluentPostgreSQL
 
@@ -20,7 +14,6 @@ final class Acronym: Codable {
   }
 }
 
-
 extension Acronym: PostgreSQLModel {}
 extension Acronym: Content {}
 extension Acronym: Parameter {}
@@ -28,10 +21,10 @@ extension Acronym: Parameter {}
 extension Acronym {
   var user: Parent<Acronym, User> {
     return parent(\.userID)
-    }
-    
-    var categories: Siblings<Acronym, Category, AcronymCategoryPivot> {
-      return siblings()
+  }
+
+  var categories: Siblings<Acronym, Category, AcronymCategoryPivot> {
+    return siblings()
   }
 }
 
@@ -42,5 +35,4 @@ extension Acronym: Migration {
       builder.reference(from: \.userID, to: \User.id)
     }
   }
-    
 }
